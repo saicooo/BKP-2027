@@ -1,0 +1,123 @@
+
+import copy
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+from torch_geometric.nn import GATConv
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+
+# Reuse the graph created in the previous cell
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+graph = graph.to(device)
+
+class GATClassifier(torch.nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=32, num_classes=2, heads=4):
+        super().__init__()
+        self.gat1 = GATConv(
+            input_dim, hidden_dim, heads=heads, dropout=0.3
+        )
+        self.gat2 = GATConv(
+            hidden_dim * heads, num_classes,
+            heads=1, concat=False, dropout=0.3
+        )
+        self.dropout = 0.5
+
+    def forward(self, x, edge_index):
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.gat1(x, edge_index)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.gat2(x, edge_index)
+
+model = GATClassifier().to(device)
+optimizer = torch.optim.Adam(
+    model.parameters(), lr=0.001, weight_decay=5e-4
+)
+
+best_val_f1 = -1
+best_state = None
+patience = 10
+epochs_without_improvement = 0
+max_epochs = 100
+
+for epoch in range(1, max_epochs + 1):
+    model.train()
+    optimizer.zero_grad()
+
+    logits = model(graph.x, graph.edge_index)
+    loss = F.cross_entropy(
+        logits[graph.train_mask],
+        graph.y[graph.train_mask]
+    )
+    loss.backward()
+    optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        val_logits = model(graph.x, graph.edge_index)
+        val_preds = val_logits[graph.val_mask].argmax(dim=1)
+        val_true = graph.y[graph.val_mask]
+
+        val_f1 = f1_score(
+            val_true.cpu().numpy(),
+            val_preds.cpu().numpy(),
+            zero_division=0
+        )
+
+    if val_f1 > best_val_f1:
+        best_val_f1 = val_f1
+        best_state = copy.deepcopy(model.state_dict())
+        epochs_without_improvement = 0
+    else:
+        epochs_without_improvement += 1
+
+    if epoch == 1 or epoch % 10 == 0:
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Loss: {loss.item():.4f} | "
+            f"Validation F1: {val_f1:.4f}"
+        )
+
+    if epochs_without_improvement >= patience:
+        print("Early stopping at epoch", epoch)
+        break
+
+# Restore the model with best validation F1
+model.load_state_dict(best_state)
+model.eval()
+
+with torch.no_grad():
+    test_logits = model(graph.x, graph.edge_index)
+    test_preds = test_logits[graph.test_mask].argmax(dim=1)
+    test_true = graph.y[graph.test_mask]
+
+y_true = test_true.cpu().numpy()
+y_pred = test_preds.cpu().numpy()
+
+print("\n=== GAT Test Results ===")
+print("Accuracy:", round(accuracy_score(y_true, y_pred), 4))
+print("Precision:", round(precision_score(y_true, y_pred, zero_division=0), 4))
+print("Recall:", round(recall_score(y_true, y_pred, zero_division=0), 4))
+print("F1:", round(f1_score(y_true, y_pred, zero_division=0), 4))
+
+print("\nClassification report:")
+print(classification_report(
+    y_true, y_pred,
+    target_names=["True", "Other categories"],
+    zero_division=0
+))
+
+print("Confusion matrix:")
+print(confusion_matrix(y_true, y_pred))
+
+torch.save(model.state_dict(), "/content/gat_baseline.pt")
+print("\nSaved: /content/gat_baseline.pt")
